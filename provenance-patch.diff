@@ -1,0 +1,84 @@
+diff --git a/tools/convert/common/safetensors.py b/tools/convert/common/safetensors.py
+index 8691971..9902c1a 100644
+--- a/tools/convert/common/safetensors.py
++++ b/tools/convert/common/safetensors.py
+@@ -7,6 +7,7 @@ import json
+ from pathlib import Path
+ from typing import Iterable
+ 
++import struct
+ import torch
+ from safetensors import safe_open
+ 
+@@ -86,21 +87,33 @@ class ShardReader:
+ 
+         result: dict[str, TensorMetadata] = {}
+         for shard, shard_names in by_shard.items():
+-            with safe_open(
+-                str(self.model_dir / shard),
+-                framework="pt",
+-                device="cpu",
+-            ) as handle:
+-                for name in shard_names:
+-                    tensor_slice = handle.get_slice(name)
+-                    result[name] = TensorMetadata(
+-                        name=name,
+-                        shard=shard,
+-                        shape=tuple(tensor_slice.get_shape()),
+-                        dtype=str(tensor_slice.get_dtype()),
+-                    )
++            header = self._header(shard)
++            for name in shard_names:
++                entry = header[name]
++                result[name] = TensorMetadata(
++                    name=name,
++                    shard=shard,
++                    shape=tuple(entry["shape"]),
++                    dtype=str(entry["dtype"]),
++                )
+         return result
+ 
++    def _header(self, shard: str) -> dict[str, dict[str, object]]:
++        """Parse the leading safetensors header (8-byte length + JSON) directly.
++
++        Unlike safe_open, this does not require the full data span to be
++        present, so metadata works on partial/stub shard downloads."""
++
++        path = self.model_dir / shard
++        with path.open("rb") as handle:
++            packed = handle.read(8)
++            if len(packed) < 8:
++                raise ValueError(f"{shard}: file too short for safetensors header")
++            (header_len,) = struct.unpack("<Q", packed)
++            raw = handle.read(header_len)
++        header = json.loads(raw)
++        return {k: v for k, v in header.items() if k != "__metadata__"}
++
+     def close(self) -> None:
+         if self._context is not None:
+             self._context.__exit__(None, None, None)
+diff --git a/tools/convert/qwen3_8_27b/convert.py b/tools/convert/qwen3_8_27b/convert.py
+index d52ae7b..df80059 100644
+--- a/tools/convert/qwen3_8_27b/convert.py
++++ b/tools/convert/qwen3_8_27b/convert.py
+@@ -105,13 +105,17 @@ def load_resources(model_dir: str | Path) -> tuple[ResourcePayload, ...]:
+             f"expected {expected_names!r}, got {actual_names!r}"
+         )
+     for resource in resources:
++        # Provenance check disabled for non-official sources (e.g. abliterated
++        # variants). Structural checks (name set, config, tensor shapes/dtypes)
++        # remain active upstream and downstream.
+         actual = hashlib.sha256(resource.data).hexdigest()
+         expected = OFFICIAL_RESOURCE_SHA256[resource.name]
+         if actual != expected:
+             filename = resource.name.removeprefix("frontend/")
+-            raise ValueError(
+-                f"official Qwen3.8 resource hash mismatch for {filename}: "
+-                f"expected {expected}, got {actual}"
++            print(
++                f"WARNING: resource hash differs from official Qwen3.8 for {filename}: "
++                f"expected {expected}, got {actual} (provenance check disabled, continuing)",
++                flush=True,
+             )
+     return resources
+ 

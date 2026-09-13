@@ -1,0 +1,9 @@
+# runtime outputs (the 16.9 GiB artifact + conversion.json land here)
+/out/
+!/out/.gitkeep
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
