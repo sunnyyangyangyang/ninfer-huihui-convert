@@ -1,5 +1,5 @@
 # runtime outputs (the 16.9 GiB artifact + conversion.json land here)
-/out/
+/out/*
 !/out/.gitkeep
 
 # python
