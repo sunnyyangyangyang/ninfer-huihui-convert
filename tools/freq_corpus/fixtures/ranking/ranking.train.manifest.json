@@ -23,7 +23,7 @@
     "code",
     "math"
   ],
-  "tokenizer_dir": "Qwen3.6-27B base-hf-bf16 checkpoint (HF BF16 snapshot; exact local path redacted)",
+  "tokenizer_dir": "/home/neroued/models/llm/qwen/Qwen3.6-27B/base-hf-bf16",
   "top_tokens": [
     {
       "count": 1520733,

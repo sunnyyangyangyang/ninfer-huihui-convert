@@ -1,95 +1,136 @@
 #!/usr/bin/env python3
-"""Slice-streaming conversion of huihui-ai/Huihui-Qwen3.8-27B-abliterated
-(HF BF16 safetensors) into ONE NInfer groupwise-int .ninfer artifact.
+"""Slice-download conversion of huihui-ai/Huihui-Qwen3.8-27B-abliterated
+(HF BF16 safetensors, 18 shards, ~56 GiB) into ONE NInfer v3 groupwise-int
+.ninfer artifact (~17 GiB, qwen3.8-27b/groupwise-int family).
 
-Download mechanism (huggingface_hub based, proven in production runs):
-  - huggingface_hub (NOT raw curl) with HF_HUB_DISABLE_XET=1 (xet breaks on
-    some CDN edges);
-  - the whole HF cache lives on tmpfs (HF_HOME under /tmp);
-  - tmpfs type assertion + free-space gate before starting.
+v3-era pipeline (NInfer master @ f76e19c0, 2026-09-17; vendored in tools/):
 
-Memory strategy (tmpfs-hosted):
-  phase 1: download frontend files + config + index, run a light preflight
-           (config dims, resource names/hashes, object plan, draft shortlist).
-  phase 2: for each shard in order: hub-download it, validate its tensors'
-           shape/dtype from the safetensors header, quantize every object whose
-           source tensors all live in the current shard window, store encoded
-           payloads on tmpfs, then delete shards (symlink + blob) no remaining
-           object needs. Only 1-2 shards are resident at a time.
-  phase 3: assemble the .ninfer from the stored payloads in plan order,
-           deleting each payload as it is written (streaming copy).
+  phase 1 -- verify the NVMe scratch volume, download config/index + frontend
+             resources (HF cache on the scratch volume; huggingface_hub,
+             resumable, LFS sha256 validation), then run the full preflight:
+             Qwen3.5-family config parsing, tokenizer token-domain validation,
+             the official qwen3_8_27b recipe assignment (Q4/Q5 projections +
+             Q8 embedding/output, Q6 vision patch embedding, Q8 mergers/MTP),
+             and the indexed proposal head (131,072 rows from the vendored
+             frequency ranking). The chat template is pinned to the maintained
+             tools/chat_templates/qwen3_8.jinja via a resource override.
+  phase 2 -- download ALL 18 safetensors shards, structurally validate every
+             shard header (the v3 SafetensorsSource reads the 8-byte length
+             prefix + JSON header directly, so validation is exact and works
+             on the complete files), then run the v3 converter in ONE
+             streaming pass: ArtifactWriter receives the complete precomputed
+             object plan up front and each weight job's quantized rows
+             (groupwise int: Q4/Q5G64 + Q8G32, FP16 group scales,
+             row-split-k128-v1 layout; amax/encode on GPU) stream straight
+             into the final file -- no intermediate payload directory.
+  phase 3 -- the converter's conversion.json report (source provenance +
+             artifact sha256 added), artifact + report copied to the repo's
+             out/, scratch volume cleared (unless --keep).
+
+Why NVMe scratch instead of the v2-era tmpfs shard window: the v3 converter's
+prepare() step touches every source tensor (a one-element preflight per
+input) before producing anything, so the old "at most two shards resident"
+window no longer fits the converter; the ~56 GiB of shards fits comfortably
+on the scratch volume, and the v3 streaming writer removes the need for the
+payload staging directory entirely.
+
+No local patches are required anymore: v2's two provenance patches are
+absorbed or obsolete upstream -- direct safetensors header reads are now
+native to the v3 SafetensorsSource, and the v3 resource loader performs no
+SHA-256 provenance check at all (the maintained chat template is supplied
+via the resource override instead).
 
 Run from anywhere:  ./convert_huihui_ninfer.py [--keep]
-  (default: after assembly the artifact + report are copied to ./out/ and all
-   tmpfs working dirs are deleted; --keep leaves them in place)
+  (default: after conversion the artifact + report are copied to ./out/ and
+   the scratch volume is cleared; --keep leaves it in place)
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import re
 import shutil
 import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent  # vendored tools/ lives at the repo root
-PERSISTENT_OUT = Path(__file__).resolve().parent / "out"
+PERSISTENT_OUT = REPO_ROOT / "out"
 sys_path_boot = __import__("sys")
 sys_path_boot.path.insert(0, str(REPO_ROOT))
 
 MODEL_NAME = "huihui-ai/Huihui-Qwen3.8-27B-abliterated"
-HF_HOME = Path("/tmp/huihui-hf")          # huggingface_hub cache root (tmpfs)
-PAYLOAD_DIR = Path("/tmp/huihui-payloads")
-ARTIFACT_OUT = Path("/tmp/qwen3_8_27b_huihui.ninfer")
+SCRATCH = REPO_ROOT / "scratch"          # NVMe working volume (HF cache + shards live here)
+HF_HOME = SCRATCH / "hf-cache"           # huggingface_hub cache root (on NVMe, not tmpfs)
+ARTIFACT_OUT = SCRATCH / "qwen3_8_27b_huihui.ninfer"
 REPORT_OUT = Path(str(ARTIFACT_OUT) + ".conversion.json")
 
+# Frontend resources pulled from the Huihui checkpoint; chat_template.jinja is
+# deliberately NOT among them -- the maintained official template is pinned
+# via a resource override (see CHAT_TEMPLATE).
 FRONTEND_FILES = (
     "config.json",
     "model.safetensors.index.json",
     "tokenizer.json",
     "tokenizer_config.json",
-    "chat_template.jinja",
     "generation_config.json",
     "preprocessor_config.json",
     "video_preprocessor_config.json",
 )
 
-MIN_FREE_GIB = 25  # tmpfs free-space gate before starting
+CHAT_TEMPLATE = REPO_ROOT / "tools" / "chat_templates" / "qwen3_8.jinja"
+RANKING = REPO_ROOT / "tools" / "freq_corpus" / "fixtures" / "ranking" / "ranking.train.counts.i64"
+COMPONENTS = ("text", "vision", "mtp")   # dflash2 is not present in the Huihui base checkpoint
+PROPOSAL_ROWS = 131072
+
+# Scratch volume budget: ~56 GiB shards + ~17 GiB artifact + headroom.
+MIN_FREE_GIB = 80
+
+ALLOWED_SOURCE_DTYPES = {"BF16", "F16", "F32", "I32", "I64", "I8", "U8", "F8_E4M3"}
+
+MODEL_DIR: Path = Path(".")  # set to the hub snapshot dir by phase1
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-def tmpfs_used_mb() -> int:
-    return shutil.disk_usage("/tmp").used // 1024**2
+def scratch_used_mb() -> int:
+    return shutil.disk_usage(str(SCRATCH)).used // 1024**2
 
 
-def check_tmpfs() -> None:
-    """Assert /tmp really is tmpfs and has headroom before starting."""
+def scratch_check() -> None:
+    """Assert the scratch volume is real disk (not tmpfs) with headroom."""
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    target = str(SCRATCH.resolve())
     fstype = "unknown"
+    best = ""
     with open("/proc/mounts", encoding="ascii", errors="replace") as fh:
         for line in fh:
             parts = line.split()
-            if len(parts) >= 3 and parts[1] == "/tmp":
-                fstype = parts[2]
-                break
-    if fstype != "tmpfs":
+            if len(parts) < 3:
+                continue
+            mount = parts[1]
+            if (target + "/").startswith(mount + "/") or mount == target:
+                if len(mount) > len(best):
+                    best = mount
+                    fstype = parts[2]
+    if fstype == "tmpfs":
         raise RuntimeError(
-            f"/tmp is '{fstype}', not tmpfs; refusing (this pipeline is sized for tmpfs)"
+            f"scratch volume {target} is tmpfs; the v3 pipeline needs ~80 GiB of "
+            "durable scratch (shards + artifact) -- point the repo at NVMe space"
         )
-    free = shutil.disk_usage("/tmp").free
+    free = shutil.disk_usage(str(SCRATCH)).free
     if free < MIN_FREE_GIB * 1024**3:
         raise RuntimeError(
-            f"/tmp free {free // 1024**3} GiB < required {MIN_FREE_GIB} GiB; "
-            "clear tmpfs or lower MIN_FREE_GIB"
+            f"scratch free {free // 1024**3} GiB < required {MIN_FREE_GIB} GiB; "
+            "clear the scratch volume or lower MIN_FREE_GIB"
         )
-    log(f"tmpfs check ok: /tmp is tmpfs, free {free // 1024**3} GiB")
+    log(f"scratch check ok: {target} is {fstype}, free {free // 1024**3} GiB")
 
 
 def sha256_of(path: Path) -> str:
+    import hashlib
+
     h = hashlib.sha256()
     with path.open("rb") as fh:
         for chunk in iter(lambda: fh.read(16 * 1024**2), b""):
@@ -101,7 +142,7 @@ def download_file(filename: str) -> Path:
     """One file through huggingface_hub (resumes in-cache, validates LFS sha256)."""
     from huggingface_hub import hf_hub_download
 
-    log(f"downloading {filename} via hf-hub [tmpfs {tmpfs_used_mb()} MiB]")
+    log(f"downloading {filename} via hf-hub [scratch {scratch_used_mb()} MiB]")
     started = time.time()
     r = hf_hub_download(MODEL_NAME, filename, cache_dir=str(HF_HOME))
     p = Path(getattr(r, "path", r))
@@ -109,25 +150,10 @@ def download_file(filename: str) -> Path:
     return p
 
 
-def evict_file(filename: str) -> None:
-    """Remove a shard from the hub cache: the snapshot symlink and its blob."""
-    link = MODEL_DIR / filename
-    if not (link.exists() or link.is_symlink()):
-        return
-    try:
-        blob = link.resolve()
-        if str(blob).startswith(str(HF_HOME)) and blob.exists() and not blob.is_symlink():
-            blob.unlink()
-    finally:
-        link.unlink(missing_ok=True)
-    log(f"  evicted {filename} [tmpfs {tmpfs_used_mb()} MiB]")
-
-
-MODEL_DIR: Path = Path(".")  # set to the hub snapshot dir by phase1
-
-
 def shard_order(model_dir: Path) -> list[str]:
     index = json.loads((model_dir / "model.safetensors.index.json").read_text())
+    import re
+
     shards = sorted(
         set(index["weight_map"].values()),
         key=lambda s: int(re.search(r"model-(\d+)-of", s).group(1)),
@@ -135,219 +161,168 @@ def shard_order(model_dir: Path) -> list[str]:
     return shards
 
 
-def preflight_light(model_dir: Path):
-    """Config/resources/plan/draft preflight without source-tensor checks.
+def preflight(model_dir: Path) -> None:
+    """Config parsing, resource/token-domain validation, recipe + proposal build.
 
-    Source shape/dtype validation happens per shard in phase 2 (source
-    metadata is read lazily from the safetensors headers, never up front)."""
-    from tools.convert.qwen3_6.common.conversion import load_json
-    from tools.convert.qwen3_6.common.recipe import SourcePreflight, source_requirements
-    from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
-    from tools.convert.qwen3_6_27b import draft_head, recipe
-    from tools.convert.qwen3_8_27b import convert as conv
+    Nothing here touches shard data, so it can run before the shards download:
+    build_model only needs config.json + frontend resources; the recipe and
+    proposal head construction are pure config work (source reads stay lazy
+    until the v3 prepare() step in phase 2).
+    """
+    from tools.convert.official_recipes import RECIPES
+    from tools.convert.proposal import add_official_proposal
+    from tools.convert.qwen3_5 import build_model
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
 
-    model = Path(model_dir)
-    config_summary = qwen3_6_convert.validate_config(load_json(model / "config.json"))
-    conv.preflight_inventory()
-    source = SourcePreflight(
-        recipe_count=len(recipe.RECIPE_SPECS),
-        source_tensor_count=len(source_requirements(recipe.RECIPE_SPECS)),
-        source_shard_count=len(set(shard_order(model))),
-        source_dtype_counts={},
+    if not CHAT_TEMPLATE.is_file():
+        raise RuntimeError(f"maintained chat template missing: {CHAT_TEMPLATE}")
+    if not RANKING.is_file():
+        raise RuntimeError(f"proposal ranking fixture missing: {RANKING}")
+
+    with SafetensorsSource(str(model_dir)) as base:
+        model = build_model(
+            base,
+            components=COMPONENTS,
+            resource_overrides={"chat_template.jinja": str(CHAT_TEMPLATE)},
+        )
+        recipe = Recipe(model)
+        RECIPES["qwen3_8_27b"](model, recipe, {"base": base})
+        add_official_proposal(recipe, ranking=str(RANKING), rows=PROPOSAL_ROWS)
+    log(
+        "preflight OK: "
+        f"{len(model.parameters)} logical parameters, "
+        f"vocab {model.config['vocab_size']}, "
+        f"{len(model.components)} components {sorted(model.components)}, "
+        f"token domain {model.token_count}, proposal {PROPOSAL_ROWS} rows"
     )
-    resources = conv.load_resources(model)
-    object_plan = conv.build_object_plan({r.name: r.data for r in resources})
-    draft = draft_head.compute_shortlist(conv._repo_root() / draft_head.DEFAULT_RANKING, model)
-    return conv.ConversionPreflight(
-        model_dir=model,
-        config_summary=config_summary,
-        source=source,
-        resources=resources,
-        draft=draft,
-        object_plan=object_plan,
-    )
 
 
-def phase1():
+def phase1() -> None:
     global MODEL_DIR
+    scratch_check()
     HF_HOME.mkdir(parents=True, exist_ok=True)
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
     first = download_file(FRONTEND_FILES[0])
     MODEL_DIR = first.parent  # hub snapshot dir: all repo files land here
     log(f"model dir = {MODEL_DIR}")
     for name in FRONTEND_FILES[1:]:
         download_file(name)
-    log("running light preflight (config dims, resource names/hashes, object plan, draft shortlist)...")
-    pre = preflight_light(MODEL_DIR)
-    log("preflight OK (source shape/dtype checks deferred to per-shard phase 2)")
-    return pre
+    log("running preflight (config dims, resources/token domain, recipe, proposal)...")
+    preflight(MODEL_DIR)
 
 
-def phase2() -> None:
-    import torch
+def validate_shards() -> None:
+    """Per-shard structural validation straight from the safetensors headers."""
+    from tools.convert.sources.safetensors import SafetensorsSource
 
-    from tools.convert.common.quantize import pick_device
-    from tools.convert.common.safetensors import ShardReader
-    from tools.convert.qwen3_6.common.recipe import source_requirements
-    from tools.convert.qwen3_6_27b import convert as qwen3_6_convert
-    from tools.convert.qwen3_6_27b import recipe
-    from tools.convert.qwen3_8_27b import inventory
+    with SafetensorsSource(str(MODEL_DIR)) as store:
+        by_shard: dict[str, list[str]] = {}
+        for name, file in store.weight_map.items():
+            by_shard.setdefault(str(file), []).append(name)
+        for shard in shard_order(MODEL_DIR):
+            file = MODEL_DIR / shard
+            if not file.is_file():
+                raise RuntimeError(f"shard missing after download: {file}")
+            infos = store._header(file)  # direct 8-byte-prefix + JSON header read
+            for name in by_shard[str(file)]:
+                info = infos[name]
+                if info.dtype not in ALLOWED_SOURCE_DTYPES:
+                    raise ValueError(f"{shard}/{name}: unsupported source dtype {info.dtype}")
+            log(f"  {shard}: header validated ({len(infos)} tensors)")
+
+
+def convert_v3() -> dict:
+    """Single streaming pass of the v3 converter over the downloaded shards."""
+    from tools.convert.official_recipes import RECIPES
+    from tools.convert.pipeline import convert
+    from tools.convert.proposal import add_official_proposal
+    from tools.convert.qwen3_5 import build_model
+    from tools.convert.quantization.groupwise import pick_device
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
 
     device = pick_device("cuda")
     log(f"quantization device: {device}")
-    PAYLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    if ARTIFACT_OUT.exists() or REPORT_OUT.exists():
+        log("removing stale partial artifact/report from an interrupted run")
+        ARTIFACT_OUT.unlink(missing_ok=True)
+        REPORT_OUT.unlink(missing_ok=True)
 
-    weight_map = json.loads((MODEL_DIR / "model.safetensors.index.json").read_text())["weight_map"]
-    reqs = source_requirements(recipe.RECIPE_SPECS)
-    reqs_by_shard: dict[str, dict] = {}
-    for name, req in reqs.items():
-        reqs_by_shard.setdefault(weight_map[name], {})[name] = req
-
-    def obj_shards(spec) -> frozenset[str]:
-        if isinstance(spec, inventory.ResourceSpec):
-            return frozenset()
-        rec = recipe.RECIPES_BY_NAME[spec.name]
-        from tools.convert.qwen3_6.common.recipe import source_requirements as sr
-
-        return frozenset(weight_map[s] for s in sr([rec]))
-
-    all_specs = list(inventory.OBJECT_SPECS)
-    shards_needed = {s.name: obj_shards(s) for s in all_specs}
-    shard_names = shard_order(MODEL_DIR)
-
-    def payload_path(spec) -> Path:
-        idx = all_specs.index(spec)
-        safe = spec.name.replace("/", "_").replace(":", "_")
-        return PAYLOAD_DIR / f"obj-{idx:04d}-{safe}.bin"
-
-    pending = [
-        s for s in all_specs
-        if not isinstance(s, inventory.ResourceSpec) and not payload_path(s).exists()
-    ]
-    tensor_total = sum(1 for s in all_specs if not isinstance(s, inventory.ResourceSpec))
-    completed = tensor_total - len(pending)
-    log(f"phase 2: {len(pending)} tensor objects to materialize+quantize "
-        f"across {len(shard_names)} shards")
-    window: set[str] = set()
-
-    for shard in shard_names:
-        if shard not in window:
-            download_file(shard)
-            window.add(shard)
-            # per-shard structural validation from the (full) safetensors header
-            if shard in reqs_by_shard:
-                with ShardReader(MODEL_DIR) as reader:
-                    meta = reader.metadata(list(reqs_by_shard[shard]))
-                for name, req in reqs_by_shard[shard].items():
-                    actual = meta[name]
-                    if actual.shape != req.shape or actual.dtype != req.dtype:
-                        raise ValueError(
-                            f"{name}: source shape {actual.shape} dtype {actual.dtype} "
-                            f"!= required {req.shape} {req.dtype}"
-                        )
-                log(f"  {shard}: header validated ({len(reqs_by_shard[shard])} tensors)")
-        with ShardReader(MODEL_DIR) as reader:
-            for spec in list(pending):
-                if shards_needed[spec.name] - window:
-                    continue
-                started = time.time()
-                tensor = qwen3_6_convert.materialize_tensor(spec, reader, DRAFT_CTX[0])
-                payload = qwen3_6_convert.encode_tensor_payload(tensor, spec, device)
-                del tensor
-                payload_path(spec).write_bytes(payload)
-                del payload
-                completed += 1
-                pending.remove(spec)
-                torch.cuda.empty_cache() if device.type == "cuda" else None
-                log(
-                    f"  [{completed}/{tensor_total}] {spec.name} (shard {shard}) "
-                    f"in {time.time() - started:.1f}s [tmpfs {tmpfs_used_mb()} MiB]"
-                )
-        needed: set[str] = set()
-        for spec in pending:
-            needed |= shards_needed[spec.name]
-        for old in sorted(window - needed):
-            evict_file(old)
-            window.discard(old)
-        if not pending:
-            break
-        log(f"shard {shard} window done; resident={sorted(window)} [tmpfs {tmpfs_used_mb()} MiB]")
-    if pending:
-        raise RuntimeError(f"shards exhausted with pending objects: {[s.name for s in pending]}")
-    log("phase 2 complete: all tensor payloads on tmpfs")
-
-
-DRAFT_CTX: tuple = ()
-
-
-def phase3_assemble() -> None:
-    from tools.artifact.container import ArtifactIdentity, ArtifactWriter
-    from tools.convert.qwen3_8_27b import inventory
-    from tools.convert.qwen3_8_27b.convert import RECIPE_ID
-
-    preflight = preflight_light(MODEL_DIR)  # re-verify + resource bytes
-    all_specs = list(inventory.OBJECT_SPECS)
-    resources = {r.name: r.data for r in preflight.resources}
-    log(f"phase 3: assembling {ARTIFACT_OUT}")
     started = time.time()
-    writer = ArtifactWriter(
-        ARTIFACT_OUT,
-        ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
-        preflight.object_plan.specs,
-    )
-    try:
-        for idx, spec in enumerate(all_specs):
-            if isinstance(spec, inventory.ResourceSpec):
-                writer.write(spec.name, resources[spec.name])
-            else:
-                p = payload_path_global(idx, spec)
-                if not p.exists():
-                    raise RuntimeError(f"missing payload {p}")
-                with p.open("rb") as fh:
-                    writer.write(spec.name, fh)
-                p.unlink()
-        writer.finish()
-    finally:
-        writer.close()
-    final_bytes = ARTIFACT_OUT.stat().st_size
+
+    def progress(index: int, total: int, job) -> None:
+        label = job.parameters[0]
+        if len(job.parameters) > 1:
+            label += f" (+{len(job.parameters) - 1})"
+        log(
+            f"  [{index + 1}/{total}] {label}: {job.spec.format} {job.spec.shape} "
+            f"[scratch {scratch_used_mb()} MiB]"
+        )
+
+    with SafetensorsSource(str(MODEL_DIR)) as base:
+        model = build_model(
+            base,
+            components=COMPONENTS,
+            resource_overrides={"chat_template.jinja": str(CHAT_TEMPLATE)},
+        )
+        recipe = Recipe(model)
+        RECIPES["qwen3_8_27b"](model, recipe, {"base": base})
+        add_official_proposal(recipe, ranking=str(RANKING), rows=PROPOSAL_ROWS)
+        report = convert(
+            model,
+            recipe,
+            ARTIFACT_OUT,
+            name="qwen3.8-27b",
+            provenance={
+                "converter": "ninfer-v3",
+                "recipe": "qwen3_8_27b (official) + indexed proposal head",
+                "sources": {
+                    "base": {
+                        "repo": MODEL_NAME,
+                        "path": str(MODEL_DIR),
+                        "files": "HF safetensors shards (18) + config + frontend resources",
+                    }
+                },
+                "ranking": str(RANKING),
+                "provenance_note": (
+                    "converted from the non-official Huihui abliterated checkpoint; "
+                    "weights are Huihui's, structure matches the official "
+                    "qwen3.8-27b/groupwise-int family; the maintained official "
+                    "chat template is pinned via resource override; source "
+                    "header shape/dtype validated per shard during phase 2"
+                ),
+            },
+            device=str(device),
+            rows_per_chunk=512,
+            progress=progress,
+        )
     elapsed = time.time() - started
-    report = {
-        "source": {
-            "repo": MODEL_NAME,
-            "files": "HF safetensors shards (18) + config + 6 frontend resources",
-        },
-        "identity": {
-            "model_id": inventory.MODEL_ID,
-            "weights_id": inventory.WEIGHTS_ID,
-            "target_key": inventory.TARGET_KEY,
-            "recipe_id": RECIPE_ID,
-        },
-        "out": str(ARTIFACT_OUT),
-        "bytes": final_bytes,
-        "sha256": sha256_of(ARTIFACT_OUT),
-        "objects": len(preflight.object_plan.objects),
-        "payload_span_bytes": preflight.object_plan.payload_span_bytes,
-        "elapsed_seconds": round(elapsed, 1),
-        "device": "cuda" if __import__("torch").cuda.is_available() else "cpu",
-        "provenance_note": (
-            "converted from a non-official source; official Qwen3.8 resource "
-            "SHA-256 provenance check was disabled by local patch; source "
-            "shape/dtype validated per shard during phase 2"
-        ),
-    }
-    REPORT_OUT.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-    log(f"artifact: {final_bytes / 1024**3:.2f} GiB in {elapsed:.1f}s")
-    log(f"sha256: {report['sha256']}")
-    log(f"report: {REPORT_OUT}")
+    report["source_sha256_note"] = "sha256 of the artifact file is recorded below"
+    report["artifact_sha256"] = sha256_of(ARTIFACT_OUT)
+    report_path = Path(str(ARTIFACT_OUT) + ".conversion.json")
+    data = json.loads(report_path.read_text())
+    data["source_sha256_note"] = report["source_sha256_note"]
+    data["artifact_sha256"] = report["artifact_sha256"]
+    report_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    log(f"conversion done: {report['objects']} objects in {elapsed:.0f}s")
+    log(f"artifact: {ARTIFACT_OUT.stat().st_size / 1024**3:.2f} GiB")
+    log(f"sha256: {report['artifact_sha256']}")
+    return report
 
 
-def payload_path_global(idx: int, spec) -> Path:
-    safe = spec.name.replace("/", "_").replace(":", "_")
-    return PAYLOAD_DIR / f"obj-{idx:04d}-{safe}.bin"
+def phase2() -> dict:
+    for shard in shard_order(MODEL_DIR):
+        if not (MODEL_DIR / shard).is_file():
+            download_file(shard)
+            continue
+        log(f"  {shard} already present (resume)")
+    validate_shards()
+    log("phase 2: single-pass v3 conversion (prepare + streaming quantization)...")
+    return convert_v3()
 
 
 def final_collect(keep: bool = False) -> None:
-    """Copy artifact + report to the persistent out/ dir, then clear tmpfs."""
+    """Copy artifact + report to the persistent out/ dir, then clear scratch."""
     if not ARTIFACT_OUT.exists():
         log("nothing to collect (artifact missing)")
         return
@@ -360,34 +335,24 @@ def final_collect(keep: bool = False) -> None:
         shutil.copy2(REPORT_OUT, PERSISTENT_OUT / REPORT_OUT.name)
     log(f"persistent copy: {dest}")
     if keep:
-        log("--keep set: tmpfs working dirs left in place")
+        log("--keep set: scratch volume left in place")
         return
-    for path in (PAYLOAD_DIR, HF_HOME):
-        shutil.rmtree(path, ignore_errors=True)
-    ARTIFACT_OUT.unlink(missing_ok=True)
-    REPORT_OUT.unlink(missing_ok=True)
-    log(f"tmpfs cleared; final size {tmpfs_used_mb()} MiB")
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    log(f"scratch cleared; final size {scratch_used_mb()} MiB")
 
 
 def main() -> None:
-    global DRAFT_CTX
-    import argparse as _ap
-
-    parser = _ap.ArgumentParser(description=__doc__)
-    parser.add_argument("--keep", action="store_true",
-                        help="leave tmpfs working dirs after conversion")
+    parser = __import__("argparse").ArgumentParser(description=__doc__)
+    parser.add_argument("--keep", action="store_true", help="leave scratch after conversion")
     args = parser.parse_args()
 
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")          # xet breaks on some CDN edges
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     t0 = time.time()
-    check_tmpfs()
-    pre = phase1()
-    DRAFT_CTX = (pre.draft,)
+    phase1()
     phase2()
-    phase3_assemble()
     final_collect(keep=args.keep)
-    log(f"ALL DONE in {(time.time() - t0) / 60:.1f} min; tmpfs used {tmpfs_used_mb()} MiB")
+    log(f"ALL DONE in {(time.time() - t0) / 60:.1f} min")
 
 
 if __name__ == "__main__":
